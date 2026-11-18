@@ -1,0 +1,8 @@
+# حماية ملف الأسرار والتوكنات من الرفع العلني
+.env
+*.log
+__pycache__/
+.pydeps/
+.local/
+vortex.db-wal
+vortex.db-shm

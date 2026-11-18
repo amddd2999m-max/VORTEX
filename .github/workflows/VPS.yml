@@ -1,0 +1,240 @@
+name: خادم افتراضي خاص
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'
+
+# 🔒 قفل صارم يمنع تشغيل أكثر من خادم واحد في نفس الوقت نهائياً (حماية للحساب وللبوتات)
+concurrency:
+  group: vortex-single-active-vps-${{ github.repository }}
+  cancel-in-progress: true
+
+permissions:
+  actions: write
+  contents: write
+  pages: write
+
+jobs:
+  secure-vps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: Prevent Duplicate Runs (حماية الحساب من تعدد الخوادم)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        run: |
+          echo "🛡️ فحص وإلغاء أي خادم مكرر يعمل في الخلفية لضمان بقاء خادم واحد فقط..."
+          OTHER_RUNS=$(gh run list --workflow=VPS.yml --status=in_progress --json databaseId --jq ".[] | select(.databaseId != $CURRENT_RUN_ID) | .databaseId" || true)
+          for rid in $OTHER_RUNS; do
+            echo "🛑 إلغاء الخادم المكرر رقم: $rid"
+            gh run cancel "$rid" || true
+          done
+          QUEUED_RUNS=$(gh run list --workflow=VPS.yml --status=queued --json databaseId --jq ".[] | select(.databaseId != $CURRENT_RUN_ID) | .databaseId" || true)
+          for qid in $QUEUED_RUNS; do
+            echo "🛑 إلغاء الخادم المنتظر رقم: $qid"
+            gh run cancel "$qid" || true
+          done
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Load All Secrets in One Click (ENV_FILE) & Link Termius Folder
+        env:
+          ENV_FILE_SECRET: ${{ secrets.ENV_FILE }}
+          FALLBACK_TS_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          if [ -n "$ENV_FILE_SECRET" ]; then
+            printf "%s\n" "$ENV_FILE_SECRET" > .env
+            sed -i 's/\r$//' .env
+            echo "✅ تم توليد ملف .env من السر الشامل ENV_FILE بنجاح"
+          fi
+          sudo ln -sfn "$GITHUB_WORKSPACE" /root/vortex
+          if [ -f .env ]; then
+            TS_FROM_ENV=$(grep -E '^TAILSCALE_AUTH_KEY=' .env | cut -d'=' -f2- | tr -d '"' | tr -d "'" | xargs || true)
+            PORT_FROM_ENV=$(grep -E '^PORT=' .env | cut -d'=' -f2- | tr -d '"' | tr -d "'" | xargs || true)
+            FB_URL_ENV=$(grep -E '^FIREBASE_DATABASE_URL=' .env | cut -d'=' -f2- | tr -d '"' | tr -d "'" | xargs || true)
+            FB_AUTH_ENV=$(grep -E '^FIREBASE_AUTH=' .env | cut -d'=' -f2- | tr -d '"' | tr -d "'" | xargs || true)
+          fi
+          FINAL_TS_KEY="${TS_FROM_ENV:-$FALLBACK_TS_KEY}"
+          FINAL_PORT="${PORT_FROM_ENV:-11025}"
+          FINAL_FB_URL="${FB_URL_ENV:-https://vortex-b521e-default-rtdb.firebaseio.com}"
+          echo "RESOLVED_TS_KEY=$FINAL_TS_KEY" >> "$GITHUB_ENV"
+          echo "VORTEX_PORT=$FINAL_PORT" >> "$GITHUB_ENV"
+          echo "RESOLVED_FB_URL=$FINAL_FB_URL" >> "$GITHUB_ENV"
+          echo "RESOLVED_FB_AUTH=$FB_AUTH_ENV" >> "$GITHUB_ENV"
+
+      - name: Free Up Disk Space (~55 GB SSD)
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          df -h /
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install FFmpeg, Cloudflared, tmux & Python Packages
+        run: |
+          sudo apt update -y
+          sudo apt install -y ffmpeg openssh-server tmux htop jq
+          curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared
+          sudo install -m 755 /tmp/cloudflared /usr/local/bin/cloudflared
+          rm -f /tmp/cloudflared
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Install SSH & Tailscale (For Termius App)
+        run: |
+          echo 'root:admin@123' | sudo chpasswd
+          sudo sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo systemctl enable ssh
+          sudo systemctl restart ssh
+          if [ -n "$RESOLVED_TS_KEY" ]; then
+            curl -fsSL https://tailscale.com/install.sh | sh
+            sudo tailscale up --authkey="$RESOLVED_TS_KEY" --hostname=vortex-vps --reset || true
+            TSIP=$(tailscale ip -4 2>/dev/null | head -n 1 || true)
+            echo "TAILSCALE_IP=$TSIP" >> "$GITHUB_ENV"
+            echo "✅ Termius SSH Ready! IP: $TSIP | Port: 22 | User: root | Pass: admin@123"
+          else
+            echo "ℹ️ لم يتم إدخال TAILSCALE_AUTH_KEY بعد — سيعمل البوت والميني آب بشكل طبيعي 100%"
+          fi
+
+      - name: Start Cloudflare Tunnel & Activate Permanent Mini App URL (Firebase + GitHub Pages Bridge)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          nohup cloudflared tunnel --url http://localhost:${VORTEX_PORT} --no-autoupdate > cloudflared.log 2>&1 &
+          TUNNEL_URL=""
+          for i in $(seq 1 25); do
+            TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' cloudflared.log | head -n 1 || true)
+            if [ -n "$TUNNEL_URL" ]; then break; fi
+            sleep 1
+          done
+
+          # 1. تفعيل استضافة GitHub Pages الثابتة تلقائياً على المستودع (مع التحقق الصارم من صحة الرابط ومنع تسرب أخطاء 404)
+          BRANCH_NAME="${GITHUB_REF_NAME:-main}"
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/pages" -f build_type=legacy -f "source[branch]=${BRANCH_NAME}" -f "source[path]=/" >/dev/null 2>&1 || gh api -X PUT "repos/${GITHUB_REPOSITORY}/pages" -f build_type=legacy -f "source[branch]=${BRANCH_NAME}" -f "source[path]=/" >/dev/null 2>&1 || true
+          sleep 2
+          PAGES_URL=""
+          if PAGES_RAW=$(gh api "repos/${GITHUB_REPOSITORY}/pages" --jq '.html_url // empty' 2>/dev/null); then
+            PAGES_CANDIDATE=$(printf '%s' "$PAGES_RAW" | tr -d '\r\n' | sed 's:/*$::')
+            if [[ "$PAGES_CANDIDATE" =~ ^https://[a-zA-Z0-9._-]+(/.*)?$ ]]; then
+              PAGES_URL="$PAGES_CANDIDATE"
+            fi
+          fi
+          if [ -z "$PAGES_URL" ]; then
+            echo "ℹ️ GitHub Pages غير مفعّل على هذا المستودع (غالباً لأن المستودع Private على حساب مجاني) — سيتم العمل برابط Cloudflare Tunnel الحي مباشرة بدون أي مشاكل."
+          fi
+
+          # 2. حفظ عنوان النفق الحي في live_api.json بصيغة JSON سليمة ورفعه للمستودع
+          NOW_TS=$(date +%s)
+          jq -n --arg api_url "$TUNNEL_URL" --arg permanent_url "$PAGES_URL" --argjson updated_at "$NOW_TS" '{api_url: $api_url, permanent_url: $permanent_url, updated_at: $updated_at}' > live_api.json
+          mkdir -p static
+          cp -f live_api.json static/live_api.json || true
+          touch .nojekyll
+
+          git config user.name "Vortex-VPS-AutoSave"
+          git config user.email "actions@github.com"
+          git add live_api.json static/live_api.json .nojekyll || true
+          git commit -m "Update live tunnel bridge URL" || true
+          git push || true
+
+          # 3. تحديث جسر Firebase المباشر (/public_bridge) بصيغة JSON سليمة وقواعد القراءة العامة له تلقائياً
+          if [ -n "$RESOLVED_FB_URL" ] && [ -n "$RESOLVED_FB_AUTH" ] && [ -n "$TUNNEL_URL" ]; then
+            curl -s -X PUT "${RESOLVED_FB_URL}/.settings/rules.json?auth=${RESOLVED_FB_AUTH}" -H "Content-Type: application/json" -d '{"rules":{".read":false,".write":false,"public_bridge":{".read":true}}}' >/dev/null || true
+            FB_BRIDGE_PAYLOAD=$(jq -n --arg api_url "$TUNNEL_URL" --arg permanent_url "$PAGES_URL" --argjson updated_at "$NOW_TS" '{api_url: $api_url, permanent_url: $permanent_url, updated_at: $updated_at}')
+            curl -s -X PUT "${RESOLVED_FB_URL}/public_bridge.json?auth=${RESOLVED_FB_AUTH}" -H "Content-Type: application/json" -d "$FB_BRIDGE_PAYLOAD" >/dev/null || true
+          fi
+
+          # 4. التحقق من جاهزية الرابط الثابت الدائم (PAGES_URL) أو استخدام النفق الحي مباشرة
+          ACTIVE_WEBAPP_URL="$TUNNEL_URL"
+          if [ -n "$PAGES_URL" ]; then
+            HTTP_CODE=$(curl -s -L -o /dev/null -w "%{http_code}" "${PAGES_URL}/" || echo "000")
+            if [ "$HTTP_CODE" = "200" ]; then
+              ACTIVE_WEBAPP_URL="$PAGES_URL"
+              echo "✅ الرابط الثابت الدائم شغال 100%: $PAGES_URL"
+            else
+              echo "⏳ جاري تهيئة الرابط الثابت لأول مرة ($PAGES_URL) — سيتم تثبيته تلقائياً فور جهوزيته خلال ثوانٍ!"
+            fi
+          fi
+
+          echo "LIVE_API_URL=$TUNNEL_URL" >> "$GITHUB_ENV"
+          echo "PERMANENT_WEBAPP_URL=$PAGES_URL" >> "$GITHUB_ENV"
+          echo "MINIAPP_URL=$ACTIVE_WEBAPP_URL" >> "$GITHUB_ENV"
+          echo "WEBAPP_URL=$ACTIVE_WEBAPP_URL" >> "$GITHUB_ENV"
+
+          if [ -f .env ]; then
+            grep -v -E '^(WEBAPP_URL|MINIAPP_URL|LIVE_API_URL|PERMANENT_WEBAPP_URL)=' .env > .env.tmp || true
+            mv .env.tmp .env
+            echo "LIVE_API_URL=$TUNNEL_URL" >> .env
+            echo "PERMANENT_WEBAPP_URL=$PAGES_URL" >> .env
+            echo "WEBAPP_URL=$ACTIVE_WEBAPP_URL" >> .env
+            echo "MINIAPP_URL=$ACTIVE_WEBAPP_URL" >> .env
+          fi
+          echo "🌐 Permanent URL: ${PAGES_URL:-غير مفعّل (يعمل عبر النفق الحي)} | Live API Tunnel: $TUNNEL_URL"
+
+      - name: Run Vortex Platform & Keep VPS Alive (345 Minutes)
+        run: |
+          rm -f /tmp/stop_vortex /tmp/cycle_completed
+          nohup python3 -u start.py > vortex.log 2>&1 &
+          sudo ln -sfn "$GITHUB_WORKSPACE/vortex.log" /root/vortex.log
+          sleep 6
+          echo "=== سجل تشغيل منصة فورتكس (VORTEX V20.0 Permanent URL Edition) ==="
+          cat vortex.log || true
+
+          for i in {1..69}; do
+            echo "[$(date)] VORTEX VPS Running... ($i/69) | Permanent URL: ${PERMANENT_WEBAPP_URL:-Tunnel-Only} | Tunnel: $LIVE_API_URL | Termius IP: $TAILSCALE_IP"
+            if ! pgrep -f "start.py" > /dev/null && ! pgrep -f "uvicorn" > /dev/null; then
+              if [ ! -f /tmp/stop_vortex ]; then
+                echo "⚠️ إعادة تشغيل تلقائية لسيرفر فورتكس..."
+                nohup python3 -u start.py >> vortex.log 2>&1 &
+              fi
+            fi
+            if [ $((i % 12)) -eq 0 ] && [ -f vortex.db ]; then
+              git config user.name "Vortex-VPS-AutoSave"
+              git config user.email "actions@github.com"
+              git add vortex.db || true
+              git commit -m "Hourly auto-save vortex.db" || true
+              git push || true
+            fi
+            sleep 300
+          done
+          touch /tmp/cycle_completed
+
+      - name: Stop Bots & Save Database Cleanly
+        if: always()
+        run: |
+          touch /tmp/stop_vortex
+          echo "🛑 إيقاف البوتات الحالية بنظافة لمنع تضارب التوكن..."
+          pkill -f "start.py" || true
+          pkill -f "uvicorn" || true
+          sleep 3
+
+          git config user.name "Vortex-VPS-AutoSave"
+          git config user.email "actions@github.com"
+          if [ -f vortex.db ]; then
+            git add vortex.db || true
+            git commit -m "Auto-save vortex.db on shutdown" || true
+            git push || true
+          fi
+
+      - name: Auto-Start Next Single VPS (فقط عند انتهاء الـ 6 ساعات طبيعياً وليس عند الإلغاء)
+        if: success() && !cancelled()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        run: |
+          if [ -f /tmp/cycle_completed ]; then
+            ACTIVE_COUNT=$(gh run list --workflow=VPS.yml --status=in_progress --json databaseId --jq "[.[] | select(.databaseId != $CURRENT_RUN_ID)] | length" || echo "0")
+            QUEUED_COUNT=$(gh run list --workflow=VPS.yml --status=queued --json databaseId --jq "length" || echo "0")
+            if [ "${ACTIVE_COUNT:-0}" -eq 0 ] && [ "${QUEUED_COUNT:-0}" -eq 0 ]; then
+              gh workflow run VPS.yml || true
+              echo "🔄 اكتملت الـ 6 ساعات — تم تشغيل خادم واحد جديد فقط تلقائياً!"
+            else
+              echo "ℹ️ يوجد خادم آخر قيد التشغيل أو الانتظار بالفعل — لن يتم تكرار التشغيل."
+            fi
+          fi
